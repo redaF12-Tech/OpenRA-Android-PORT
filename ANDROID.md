@@ -40,18 +40,32 @@ The Android platform layer (`OpenRA.Platforms.Android`) implements OpenRA's `IPl
 
 ## Building the native libraries
 
-The three native dependencies (FreeType, Lua, OpenAL-Soft) don't ship Android binaries, so they're built from source with the NDK:
+The three native dependencies (FreeType, Lua, OpenAL-Soft) don't ship Android binaries, so they're built from source with the NDK. All scripts derive every path from their own location and `ANDROID_NDK_ROOT` — there are no hardcoded developer paths — and copy the outputs into `OpenRA.Android/jniLibs/arm64-v8a/`:
 
 ```bash
-# All scripts are in thirdparty/. They download source, cross-compile for arm64-v8a,
-# and output 16KB-page-aligned .so files to the app's jniLibs dir.
-export PATH="$HOME/Library/Android/sdk/cmake/3.22.1/bin:$PATH"
-export ANDROID_NDK_ROOT="$HOME/Library/Android/sdk/ndk/27.1.12297006"
-
-./thirdparty/build-freetype-android.sh   # → libfreetype6.so
-./thirdparty/build-lua-android.sh        # → liblua51.so
-./thirdparty/build-openal-android.sh     # → libsoft_oal.so
+export ANDROID_NDK_ROOT="$HOME/android-sdk/ndk/27.1.12297006"  # or your NDK path
+sh thirdparty/build-freetype-android.sh   # → jniLibs/arm64-v8a/libfreetype6.so
+sh thirdparty/build-lua-android.sh        # → jniLibs/arm64-v8a/liblua51.so
+sh thirdparty/build-openal-android.sh     # → jniLibs/arm64-v8a/libsoft_oal.so
 ```
+
+The output names are fixed: `libfreetype6.so` (matches `DllImport("freetype6")`), `liblua51.so`
+(matches Eluant's `DllImport("lua51")`), and `libsoft_oal.so` (matches OpenAL-CS's
+`DllImport("soft_oal")`). `AndroidPlatform.cs` additionally preloads each library through
+Java's class loader and installs `NativeLibrary` resolvers, because .NET Android does not
+apply legacy `dllmap` config files.
+
+## Testing
+
+- `make tests` runs the deviceless engine test suite (NUnit). The touch gesture state machine
+  is pure C# (`OpenRA.Game/Input/TouchGestureMapper.cs`) and is unit-tested in
+  `OpenRA.Test/OpenRA.Game/TouchGestureMapperTests.cs` (taps, drags, long-press, pinch,
+  cancellation, multi-finger lift ordering).
+- `.github/workflows/android.yml` builds the native libraries, verifies they are ARM64,
+  builds the Release APK, checks that the three `.so` files are present inside it, scans the
+  scripts for hardcoded paths, and uploads the APK as an artifact.
+- On-device behaviors (touch feel, audio output switching, backgrounding/rotation, real
+  multiplayer) still require manual testing on physical hardware.
 
 ## Building and deploying the APK
 
@@ -81,14 +95,22 @@ adb shell am start -n net.openra.android/$(adb shell dumpsys package net.openra.
 
 ## Touch controls
 
+Gesture logic lives in `OpenRA.Game/Input/TouchGestureMapper.cs` (a deterministic state
+machine pumped from the game thread); `AndroidInput.cs` only copies `MotionEvent` values into
+a thread-safe queue on the UI thread. Thresholds are tunable fields on the mapper
+(`LongPressMs` 500, `TouchSlopPx` 16, `DoubleTapWindowMs` 300, `MinPinchDeltaPx` 2).
+
 | Gesture | Action |
 |---|---|
 | Tap | Left click |
 | Double-tap | Double-click |
-| Long-press (>500ms) | Right-click |
+| Long-press (>500ms, fires even with a stationary finger) | Right-click |
 | Drag | Move / scroll map / drag-select |
-| Two-finger drag | Pan map |
-| Pinch | Zoom in/out |
+| Two-finger drag | Pan map (right-button hold) |
+| Pinch | Zoom in/out (Scroll + Ctrl) |
+
+On `ACTION_CANCEL`, pause, or focus loss every held mouse button is released and the gesture
+state is reset, so the engine is never left with a stuck button.
 
 ## Engine modifications
 

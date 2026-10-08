@@ -69,6 +69,22 @@ namespace OpenRA.Android
 			StartEngineOnce();
 		}
 
+		// Touch gestures and held mouse buttons must be released when the app loses the screen or
+		// input focus (system dialogs, notifications, home button), otherwise the engine would be
+		// left with a button stuck "held" and the next gesture would start from a dirty state.
+		protected override void OnPause()
+		{
+			base.OnPause();
+			window?.CancelActiveGestures();
+		}
+
+		public override void OnWindowFocusChanged(bool hasFocus)
+		{
+			base.OnWindowFocusChanged(hasFocus);
+			if (!hasFocus)
+				window?.CancelActiveGestures();
+		}
+
 		// Called from the SurfaceCallback once the first stable surface is available.
 		internal void StartEngineOnce()
 		{
@@ -76,11 +92,16 @@ namespace OpenRA.Android
 				return;
 			engineStarted = true;
 
+			// Red Alert is the default mod, but the launch Intent may override it so other mods
+			// compiled into the app (cnc, d2k, ts) can be selected without a rebuild.
+			var modId = Intent?.GetStringExtra("Mod") ?? "ra";
+			global::Android.Util.Log.Info(Tag, $"Starting OpenRA with mod {modId}");
+
 			var args = new[]
 			{
 				$"Engine.EngineDir={engineDir}",
 				$"Engine.SupportDir={supportDir}",
-				"Game.Mod=ra"
+				$"Game.Mod={modId}"
 			};
 
 			new Thread(() =>
@@ -103,8 +124,28 @@ namespace OpenRA.Android
 			var dest = Path.Combine(FilesDir.AbsolutePath, "engine") + Path.DirectorySeparatorChar;
 			var marker = Path.Combine(dest, ".extracted");
 
-			if (File.Exists(marker))
-				return dest;
+			// The marker records the engine VERSION the assets were extracted from. A plain
+			// existence check would never refresh stale assets when the app is updated over an
+			// older install, so re-extract whenever the shipped VERSION differs. User data
+			// (settings, maps, downloaded content) lives in the support directory and is
+			// deliberately untouched by re-extraction.
+			string shippedVersion = null;
+			try
+			{
+				using var versionStream = Assets.Open("VERSION");
+				using var reader = new StreamReader(versionStream);
+				shippedVersion = reader.ReadToEnd().Trim();
+			}
+			catch (Java.IO.IOException) { }
+
+			if (File.Exists(marker) && shippedVersion != null)
+			{
+				var extractedVersion = ReadFileFirstLine(marker);
+				if (extractedVersion == shippedVersion)
+					return dest;
+
+				global::Android.Util.Log.Info(Tag, $"Engine assets are from {extractedVersion}; app ships {shippedVersion}. Re-extracting.");
+			}
 
 			Directory.CreateDirectory(dest);
 			CopyAssetDir("glsl", Path.Combine(dest, "glsl"));
@@ -117,9 +158,24 @@ namespace OpenRA.Android
 			foreach (var mod in new[] { "ra", "cnc", "d2k", "ts", "all", "common" })
 				Directory.CreateDirectory(Path.Combine(dest, "mods", mod, "maps"));
 
-			File.WriteAllText(marker, DateTime.UtcNow.ToString("o"));
+			// Stamp the marker with the version this extraction came from (fall back to a
+			// timestamp if the APK carries no VERSION, so a missing version can't loop re-extracts).
+			File.WriteAllText(marker, shippedVersion ?? $"unknown-{DateTime.UtcNow:yyyyMMddHHmmss}");
 			global::Android.Util.Log.Info(Tag, $"Extracted engine assets to {dest}");
 			return dest;
+		}
+
+		static string ReadFileFirstLine(string path)
+		{
+			try
+			{
+				using var reader = new StreamReader(path);
+				return (reader.ReadLine() ?? string.Empty).Trim();
+			}
+			catch (IOException)
+			{
+				return null;
+			}
 		}
 
 		void CopyAssetDir(string assetPath, string destDir)

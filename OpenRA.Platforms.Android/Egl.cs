@@ -85,6 +85,10 @@ namespace OpenRA.Platforms.Android
 		public static extern int eglGetError();
 
 		public const int EGL_SUCCESS = 0x3000;
+		public const int EGL_BAD_SURFACE = 0x300D;
+		public const int EGL_BAD_NATIVE_WINDOW = 0x300E;
+		public const int EGL_BAD_DISPLAY = 0x3008;
+		public const int EGL_BAD_MATCH = 0x3009;
 
 		public static string QueryString(IntPtr dpy, int name)
 		{
@@ -101,7 +105,12 @@ namespace OpenRA.Platforms.Android
 
 		// libandroid.so: obtain an ANativeWindow* from a Java android.view.Surface object.
 		// eglCreateWindowSurface needs the raw ANativeWindow*, NOT the Java Surface handle.
+		// ANativeWindow_fromSurface acquires a reference: pair every acquisition with
+		// ANativeWindow_release once the EGL surface built from it has been destroyed.
 		[DllImport("libandroid.so", EntryPoint = "ANativeWindow_fromSurface")]
 		public static extern IntPtr ANativeWindow_fromSurface(IntPtr jnienv, IntPtr surface);
+
+		[DllImport("libandroid.so", EntryPoint = "ANativeWindow_release")]
+		public static extern void ANativeWindow_release(IntPtr window);
 	}
 }

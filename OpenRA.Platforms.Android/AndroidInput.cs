@@ -11,7 +11,6 @@
 
 using System;
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using Android.Views;
 using OpenRA;
 using OpenRA.Primitives;
@@ -20,209 +19,102 @@ namespace OpenRA.Platforms.Android
 {
 	// Translates Android MotionEvents (multi-touch) into OpenRA MouseInputs.
 	//
-	// Touch model:
-	//   - Single tap          = left click (with double-tap detection via MultiTapDetection)
-	//   - Long press (>500ms) = right-click (context menu, unit orders)
-	//   - Drag                = mouse move with left button held (scroll the map, drag-select)
-	//   - Two-finger pinch    = scroll/zoom (synthesized as MouseInputEvent.Scroll)
-	//   - Two-finger drag     = map pan (mouse move with right button held)
+	// This class is a thin adapter only:
+	//   - Enqueue runs on the Android UI thread: it copies the primitive values out of the
+	//     MotionEvent immediately (MotionEvent instances are recycled by Android and must not
+	//     be retained) and pushes them into a lock-free queue.
+	//   - PumpInput runs on the game thread: it drains the queue into the shared
+	//     TouchGestureMapper (see OpenRA.Game/Input/TouchGestureMapper.cs), which owns all
+	//     gesture logic (tap, drag/select, long-press right-click, two-finger pan, pinch zoom)
+	//     and emits the MouseInput events the engine input system already understands.
+	//
+	// No gesture decisions are made here, and no GL or game calls happen on the UI thread.
 	sealed class AndroidInput
 	{
-		readonly ConcurrentQueue<PendingInput> pending = new();
+		readonly ConcurrentQueue<TouchGestureMapper.TouchSample> pending = new();
+		readonly TouchGestureMapper gestures = new();
 
-		// Primary finger state (left button).
-		int primaryPointerId = -1;
-		int2 primaryDownPos;
-		Stopwatch primaryDownTimer;
-
-		// Secondary finger state (right button / pan).
-		int secondaryPointerId = -1;
-
-		// Pinch state.
-		float lastPinchDist;
-
-		// Long-press detection threshold.
-		const int LongPressMs = 500;
-		const int TouchSlopPx = 16;
-
-		// Suppresses the Up event when a long-press already fired a right-click.
-		bool longPressFired;
-
-		struct PendingInput
-		{
-			public MotionEventActions Action;
-			public float X;
-			public float Y;
-			public int PointerId;
-			public long TimestampMs;
-		}
-
-		public void Enqueue(MotionEvent e, Size windowSize)
+		// Enqueue is called from the UI thread via AndroidPlatformWindow.EnqueueMotion.
+		public void Enqueue(MotionEvent e)
 		{
 			var action = e.ActionMasked;
 			var index = e.ActionIndex;
+			var timeMs = e.EventTime;
 
-			if (action == MotionEventActions.Move)
+			switch (action)
 			{
-				// Forward moves for all tracked fingers.
-				for (var i = 0; i < e.PointerCount; i++)
-				{
-					var pid = e.GetPointerId(i);
-					if (pid == primaryPointerId || pid == secondaryPointerId)
-					{
-						pending.Enqueue(new PendingInput
-						{
-							Action = action,
-							X = e.GetX(i),
-							Y = e.GetY(i),
-							PointerId = pid,
-							TimestampMs = e.EventTime
-						});
-					}
-				}
+				case MotionEventActions.Down:
+					pending.Enqueue(Sample(TouchGestureMapper.RawTouchAction.Down, e.GetPointerId(0), e.GetX(0), e.GetY(0), timeMs, e.PointerCount));
+					break;
 
-				// Detect pinch zoom when two fingers are down.
-				if (primaryPointerId >= 0 && secondaryPointerId >= 0 && e.PointerCount >= 2)
-				{
-					var i0 = e.FindPointerIndex(primaryPointerId);
-					var i1 = e.FindPointerIndex(secondaryPointerId);
-					if (i0 >= 0 && i1 >= 0)
-					{
-						var dx = e.GetX(i0) - e.GetX(i1);
-						var dy = e.GetY(i0) - e.GetY(i1);
-						var dist = (float)Math.Sqrt(dx * dx + dy * dy);
-						if (lastPinchDist > 0)
-						{
-							var delta = (int)(dist - lastPinchDist);
-							if (Math.Abs(delta) > 2)
-							{
-								pending.Enqueue(new PendingInput
-								{
-									Action = MotionEventActions.Scroll,
-									X = (e.GetX(i0) + e.GetX(i1)) / 2,
-									Y = (e.GetY(i0) + e.GetY(i1)) / 2,
-									PointerId = -1,
-									TimestampMs = e.EventTime
-								});
-								// Store the delta in the Y field via a side channel — we'll read it in PumpInput.
-								pinchDelta = delta;
-							}
-						}
+				case MotionEventActions.PointerDown:
+					pending.Enqueue(Sample(TouchGestureMapper.RawTouchAction.Down, e.GetPointerId(index), e.GetX(index), e.GetY(index), timeMs, e.PointerCount));
+					break;
 
-						lastPinchDist = dist;
-					}
-				}
-			}
-			else
-			{
-				pending.Enqueue(new PendingInput
-				{
-					Action = action,
-					X = e.GetX(index),
-					Y = e.GetY(index),
-					PointerId = e.GetPointerId(index),
-					TimestampMs = e.EventTime
-				});
+				case MotionEventActions.Move:
+					// Forward moves for every pointer in the batch; the gesture mapper filters
+					// by the ids it currently tracks.
+					for (var i = 0; i < e.PointerCount; i++)
+						pending.Enqueue(Sample(TouchGestureMapper.RawTouchAction.Move, e.GetPointerId(i), e.GetX(i), e.GetY(i), timeMs, e.PointerCount));
+
+					break;
+
+				case MotionEventActions.PointerUp:
+					pending.Enqueue(Sample(TouchGestureMapper.RawTouchAction.Up, e.GetPointerId(index), e.GetX(index), e.GetY(index), timeMs, e.PointerCount));
+					break;
+
+				case MotionEventActions.Up:
+					// Up denotes the last pointer lifting. Emit Up for every tracked pointer so
+					// the gesture state machine always returns to Idle even if an intermediate
+					// PointerUp was coalesced by the system.
+					for (var i = 0; i < e.PointerCount; i++)
+						pending.Enqueue(Sample(TouchGestureMapper.RawTouchAction.Up, e.GetPointerId(i), e.GetX(i), e.GetY(i), timeMs, e.PointerCount));
+
+					break;
+
+				case MotionEventActions.Cancel:
+					pending.Enqueue(new TouchGestureMapper.TouchSample { Action = TouchGestureMapper.RawTouchAction.Cancel, TimeMs = timeMs });
+					break;
 			}
 		}
 
-		int pinchDelta;
+		static TouchGestureMapper.TouchSample Sample(TouchGestureMapper.RawTouchAction action, int pointerId, float x, float y, long timeMs, int pointerCount)
+		{
+			return new TouchGestureMapper.TouchSample
+			{
+				Action = action,
+				PointerId = pointerId,
+				X = (int)x,
+				Y = (int)y,
+				TimeMs = timeMs,
+				PointerCount = pointerCount,
+			};
+		}
 
+		// Called from Game.Loop via AndroidPlatformWindow.PumpInput, once per frame, on the
+		// game thread. Environment.TickCount64 is a monotonic uptime clock on Android and is
+		// comparable with MotionEvent.EventTime (also uptime milliseconds); the small skew is
+		// irrelevant at the gesture-threshold scale (hundreds of ms).
 		public void PumpInput(IInputHandler inputHandler, Size windowSize, Size surfaceSize, float scale)
 		{
-			while (pending.TryDequeue(out var p))
+			while (pending.TryDequeue(out var sample))
 			{
-				var pos = new int2((int)p.X, (int)p.Y);
-
-				switch (p.Action)
-				{
-					case MotionEventActions.Down:
-						primaryPointerId = p.PointerId;
-						primaryDownPos = pos;
-						primaryDownTimer = Stopwatch.StartNew();
-						longPressFired = false;
-						var tapCount = MultiTapDetection.DetectFromMouse(0, pos);
-						inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Left, pos, int2.Zero, Modifiers.None, tapCount));
-						break;
-
-					case MotionEventActions.PointerDown:
-						if (secondaryPointerId < 0)
-						{
-							secondaryPointerId = p.PointerId;
-							lastPinchDist = 0;
-
-							// If the primary finger is down, start a right-button drag (map pan).
-							if (primaryPointerId >= 0 && !longPressFired)
-							{
-								inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
-							}
-						}
-
-						break;
-
-					case MotionEventActions.Move:
-						if (p.PointerId == primaryPointerId)
-						{
-							// Check for long-press (right-click) if the finger hasn't moved much.
-							if (!longPressFired && primaryDownTimer != null && primaryDownTimer.ElapsedMilliseconds > LongPressMs)
-							{
-								var moved = (pos - primaryDownPos).Length;
-								if (moved < TouchSlopPx)
-								{
-									longPressFired = true;
-									inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, pos, int2.Zero, Modifiers.None, 1));
-									inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
-								}
-							}
-							else
-							{
-								inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Left, pos, int2.Zero, Modifiers.None, 0));
-							}
-						}
-						else if (p.PointerId == secondaryPointerId && primaryPointerId >= 0)
-						{
-							// Two-finger pan: move with right button.
-							inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Right, pos, int2.Zero, Modifiers.None, 0));
-						}
-
-						break;
-
-					case MotionEventActions.PointerUp:
-						if (p.PointerId == secondaryPointerId)
-						{
-							// End right-button drag.
-							if (primaryPointerId >= 0 && !longPressFired)
-								inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
-							secondaryPointerId = -1;
-							lastPinchDist = 0;
-						}
-
-						break;
-
-					case MotionEventActions.Up:
-						if (longPressFired)
-						{
-							// The long-press already sent a right-click Down; send the matching Up.
-							inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Right, pos, int2.Zero, Modifiers.None, 1));
-						}
-						else
-						{
-							inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, pos, int2.Zero, Modifiers.None, MultiTapDetection.InfoFromMouse(0)));
-						}
-
-						primaryPointerId = -1;
-						primaryDownTimer = null;
-						longPressFired = false;
-						break;
-
-					case MotionEventActions.Scroll:
-						// Pinch-to-zoom: synthesize a scroll event. The zoom modifier (Ctrl) is needed
-						// by ViewportControllerWidget, so we set it to make zoom work without a keyboard.
-						inputHandler.OnMouseInput(new MouseInput(MouseInputEvent.Scroll, MouseButton.None, pos, new int2(0, pinchDelta), Modifiers.Ctrl, 0));
-						pinchDelta = 0;
-						break;
-				}
+				foreach (var mi in gestures.ProcessTouch(sample))
+					inputHandler.OnMouseInput(mi);
 			}
+
+			// Advance time-based logic (long-press) every frame, even when no new touch
+			// events arrived, so a stationary finger still produces the right-click.
+			foreach (var mi in gestures.ProcessTime(Environment.TickCount64))
+				inputHandler.OnMouseInput(mi);
+		}
+
+		// Forward cancellation from lifecycle events (focus loss, pause, surface loss) so the
+		// engine is never left with a button stuck "held".
+		public void CancelGestures(IInputHandler inputHandler)
+		{
+			foreach (var mi in gestures.CancelGesture())
+				inputHandler.OnMouseInput(mi);
 		}
 	}
 }

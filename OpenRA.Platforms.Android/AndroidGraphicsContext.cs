@@ -148,9 +148,10 @@ namespace OpenRA.Platforms.Android
 			if (!Egl.eglSwapBuffers(window.Display, window.Surface))
 			{
 				var err = Egl.eglGetError();
-				if (err == 0x300D /* EGL_BAD_SURFACE */ || err == 0x300E /* EGL_BAD_NATIVE_WINDOW */)
+				if (err == Egl.EGL_BAD_SURFACE || err == Egl.EGL_BAD_NATIVE_WINDOW)
 				{
 					// The native window died under us; force a recreation on the next frame.
+					global::Android.Util.Log.Warn("OpenRA", $"eglSwapBuffers reported 0x{err:X}; scheduling EGL surface recreation");
 					window.InvalidateSurface();
 				}
 				else
