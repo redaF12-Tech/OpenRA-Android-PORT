@@ -11,7 +11,6 @@
 
 using System;
 using System.Collections.Generic;
-using OpenRA.Primitives;
 
 namespace OpenRA
 {
@@ -38,9 +37,11 @@ namespace OpenRA
 			public int PointerId;
 			public int X;
 			public int Y;
+
 			// Monotonic milliseconds in the same clock domain for all samples (Android
 			// MotionEvent.EventTime, i.e. uptime milliseconds).
 			public long TimeMs;
+
 			// Number of pointers reported by the current MotionEvent batch.
 			public int PointerCount;
 		}
@@ -48,14 +49,19 @@ namespace OpenRA
 		public enum GestureState
 		{
 			Idle,
+
 			// One finger down, left button held, finger has not moved beyond the slop radius.
 			Pressed,
+
 			// One finger down and dragging: left button held, moves are forwarded.
 			Dragging,
+
 			// Long press fired: left was released, right button is held.
 			LongPressed,
+
 			// Two-finger pan/pinch in progress.
 			TwoFinger,
+
 			// A multi-finger gesture ended; the remaining finger is swallowed until it lifts.
 			Settling,
 		}
@@ -90,7 +96,7 @@ namespace OpenRA
 		long lastTapTime;
 		int2 lastTapPos;
 
-		readonly List<MouseInput> output = new();
+		readonly List<MouseInput> output = [];
 
 		/// <summary>Feed one raw touch sample; returns the MouseInput events it produced.</summary>
 		public IReadOnlyList<MouseInput> ProcessTouch(in TouchSample sample)
@@ -101,7 +107,7 @@ namespace OpenRA
 			switch (sample.Action)
 			{
 				case RawTouchAction.Down: HandleDown(sample.PointerId, pos, sample.TimeMs, sample.PointerCount); break;
-				case RawTouchAction.Move: HandleMove(sample.PointerId, pos, sample.TimeMs); break;
+				case RawTouchAction.Move: HandleMove(sample.PointerId, pos); break;
 				case RawTouchAction.Up: HandleUp(sample.PointerId, pos, sample.TimeMs); break;
 				case RawTouchAction.Cancel: CancelGesture(); break;
 			}
@@ -178,11 +184,11 @@ namespace OpenRA
 				lastPinchDist = 0;
 
 				if (pointerCount >= 2)
-					UpdatePinch(primaryLastPos, secondaryLastPos, timeMs);
+					UpdatePinch(primaryLastPos, secondaryLastPos);
 			}
 		}
 
-		void HandleMove(int pointerId, int2 pos, long timeMs)
+		void HandleMove(int pointerId, int2 pos)
 		{
 			switch (State)
 			{
@@ -221,7 +227,7 @@ namespace OpenRA
 					// Two-finger pan (midpoint moves with the right button) + pinch zoom.
 					output.Add(new MouseInput(MouseInputEvent.Move, MouseButton.Right,
 						(primaryLastPos + secondaryLastPos) / 2, int2.Zero, Modifiers.None, 0));
-					UpdatePinch(primaryLastPos, secondaryLastPos, timeMs);
+					UpdatePinch(primaryLastPos, secondaryLastPos);
 					break;
 			}
 		}
@@ -311,7 +317,7 @@ namespace OpenRA
 			}
 		}
 
-		void UpdatePinch(int2 a, int2 b, long timeMs)
+		void UpdatePinch(int2 a, int2 b)
 		{
 			var dx = b.X - a.X;
 			var dy = b.Y - a.Y;
