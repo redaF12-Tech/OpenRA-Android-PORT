@@ -16,6 +16,11 @@ on:
       - 'thirdparty/*.sh'
       - '.github/workflows/build-android.yml'
   workflow_dispatch:
+    inputs:
+      run_engine_tests:
+        description: 'Also run the desktop engine tests (optional, run on push/PR already).'
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -27,6 +32,7 @@ env:
 
 jobs:
   engine-tests:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_engine_tests == 'true' }}
     name: Engine tests
     runs-on: ubuntu-22.04
     steps:
