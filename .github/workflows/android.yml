@@ -80,9 +80,16 @@ jobs:
 
       - name: Install Android NDK + CMake
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "ndk;27.1.12297006" "cmake;3.22.1"
-          echo "ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/27.1.12297006" >> "$GITHUB_ENV"
+          # sdkmanager is not on PATH on GitHub-hosted runners; locate it under the SDK root.
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" "$SDK_ROOT/tools" -name sdkmanager -type f 2>/dev/null | head -1)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $SDK_ROOT"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "ndk;27.1.12297006" "cmake;3.22.1"
+          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/27.1.12297006" >> "$GITHUB_ENV"
 
       - name: Build native libraries (FreeType, Lua, OpenAL Soft)
         run: |
