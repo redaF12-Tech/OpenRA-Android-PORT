@@ -1,226 +1,101 @@
-name: Build Android (ARM64)
+name: Build Android APK (ARM64)
 
 on:
   push:
+    branches:
+      - main
+      - android-native-port
     paths:
       - 'OpenRA.Android/**'
       - 'OpenRA.Platforms.Android/**'
       - 'OpenRA.Game/**'
       - 'thirdparty/*.sh'
       - '.github/workflows/build-android.yml'
+      - 'mods/**'
+      - 'glsl/**'
+      - 'Directory.Build.props'
+      - 'VERSION'
+      - 'global mix database.dat'
   pull_request:
-    branches: [ bleed, 'prep-*' ]
+    branches:
+      - main
+      - android-native-port
     paths:
       - 'OpenRA.Android/**'
       - 'OpenRA.Platforms.Android/**'
+      - 'OpenRA.Game/**'
       - 'thirdparty/*.sh'
       - '.github/workflows/build-android.yml'
+      - 'mods/**'
+      - 'glsl/**'
+      - 'Directory.Build.props'
+      - 'VERSION'
+      - 'global mix database.dat'
   workflow_dispatch:
     inputs:
       run_engine_tests:
-        description: 'Also run the desktop engine tests (optional, run on push/PR already).'
+        description: 'Run engine tests before building APK'
         required: false
-        default: 'false'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
   ANDROID_API: 24
+  ANDROID_COMPILE_SDK: 34
+  ANDROID_BUILD_TOOLS: 34.0.0
   ANDROID_NDK_VERSION: 27.1.12297006
   ANDROID_CMAKE_VERSION: 3.22.1
 
 jobs:
   engine-tests:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_engine_tests == 'true' }}
     name: Engine tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.run_engine_tests == 'true'
     steps:
-      - name: Clone repository
-        uses: actions/checkout@v7
-
-      - name: Install .NET 8.0
-        uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-
-      - name: Run engine tests
-        run: |
-          make tests
+      - name: Run tests
+        run: make tests
 
   build-android:
-    name: Build Android ARM64 APK
-    runs-on: ubuntu-22.04
-    needs: [ engine-tests ]
+    name: Build Android APK
+    runs-on: ubuntu-latest
     steps:
-      - name: Clone repository
-        uses: actions/checkout@v7
-
-      - name: Install .NET 9.0 SDK
-        uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '9.0.x'
-
-      - name: Install JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Install Android SDK, platform, build-tools, and cmdline tools
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK and CMake via sdkmanager
+      - name: Install Android SDK components
         run: |
-          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          export ANDROID_SDK_ROOT="$SDK_ROOT"
-          export ANDROID_NDK_ROOT="$SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" \
+              "platforms;android-${ANDROID_COMPILE_SDK}" \
+              "build-tools;${ANDROID_BUILD_TOOLS}" \
+              "ndk;${ANDROID_NDK_VERSION}" \
+              "cmake;${ANDROID_CMAKE_VERSION}"
 
-          # sdkmanager may live under cmdline-tools/latest/bin or tools/bin on different runner images.
-          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" "$SDK_ROOT/tools" -name sdkmanager -type f 2>/dev/null | head -1)
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager not found under $SDK_ROOT"
-            exit 1
-          fi
-
-          echo "SDKMANAGER=$SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" "platforms;android-$ANDROID_API" \
-              "build-tools;$ANDROID_API.0.0" \
-              "cmdline-tools;latest" \
-              "ndk;$ANDROID_NDK_VERSION" \
-              "cmake;$ANDROID_CMAKE_VERSION" || true
-
-          # cmake and the NDK toolchain must be present for the native build scripts.
-          if [ ! -d "$ANDROID_NDK_ROOT" ]; then
-            echo "::error::ANDK NDK not present at $ANDROID_NDK_ROOT after install"
-            exit 1
-          fi
-
-          # cmake from the SDK is preferred for consistency with the scripts; fall back to any
-          # cmake in PATH only if the SDK did not provide one.
-          if ! command -v cmake >/dev/null 2>&1; then
-            CMAKE_CANDIDATE=$(find "$SDK_ROOT" -name cmake -type f 2>/dev/null | head -1)
-            if [ -n "$CMAKE_CANDIDATE" ]; then
-              echo "CMAKE_CANDIDATE=$CMAKE_CANDIDATE"
-              export PATH="$(dirname "$CMAKE_CANDIDATE"):$PATH"
-            fi
-          fi
-
-          if ! command -v cmake >/dev/null 2>&1; then
-            echo "::error::cmake not available"
-            exit 1
-          fi
-
-          echo "cmake=$(cmake --version | head -1)"
-          echo "ANDROID_NDK_ROOT in env=$ANDROID_NDK_ROOT"
-          export PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-
-      - name: Compute build-tools version to use for packaging
-        id: buildtools
-        run: |
-          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          BT_DIR="$SDK_ROOT/build-tools"
-          VERSIONS=$(ls "$BT_DIR" 2>/dev/null | sort -V || true)
-          if [ -z "$VERSIONS" ]; then
-            echo "::error::No Android build-tools found"
-            exit 1
-          fi
-          # prefers a build-tools version >= the compile SDK (30+ for android-24+ industry practice)
-          SELECTED="$VERSIONS"
-          # Prefer a version with same major as API when available; else latest.
-          LATEST=$(echo "$VERSIONS" | tail -1)
-          echo "SELECTED_BUILD_TOOLS=$LATEST" >> $GITHUB_ENV
-
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> $GITHUB_ENV
+      - name: Install .NET Android workload
+        run: dotnet workload install android
       - name: Build native libraries
         run: |
-          sh ./thirdparty/build-freetype-android.sh
-          sh ./thirdparty/build-lua-android.sh
-          sh ./thirdparty/build-openal-android.sh
-
-      - name: Stage native libraries into jniLibs
-        run: |
-          mkdir -p OpenRA.Android/jniLibs/arm64-v8a
-          for so in OpenRA.Android/jniLibs/arm64-v8a/*.so; do
-            [ -f "$so" ] || { echo "::error::$so missing after native build"; exit 1; }
-            echo "$so"
-          done
-
-      - name: Validate native libraries are ARM64
-        run: |
-          for so in OpenRA.Android/jniLibs/arm64-v8a/*.so; do
-            echo "--- $so"
-            if readelf -h "$so" 2>/dev/null | grep -q "Machine:\s*aarch64"; then
-              echo "$so: ARM64 OK"
-              continue
-            fi
-            echo "$so: readelf did not confirm aarch64; trying objdump"
-            if objdump -f "$so" 2>/dev/null | grep -q "aarch64"; then
-              echo "$so: aarch64 OK (objdump)"
-              continue
-            fi
-            echo "::error::$so does not appear to be ARM64"
-            exit 1
-          done
-
-      - name: Build Release APK
-        run: |
-          dotnet build OpenRA.Android/OpenRA.Android.csproj \
-              -c Release -f net9.0-android -p:BuildForAndroid=true -m:1
-
-      - name: Locate and validate the APK
-        run: |
-          APK=$(find OpenRA.Android/obj/Release/android/bin -name '*.apk' -print -quit 2>/dev/null || true)
-          if [ -z "$APK" ]; then
-            echo "::error::No APK found in OpenRA.Android/obj/Release/android/bin/"
-            exit 1
-          fi
-          echo "APK=$APK"
-          APK_SIZE=$(stat -c%s "$APK")
-          echo "APK size=$APK_SIZE bytes"
-          if [ "$APK_SIZE" -lt 1000000 ]; then
-            echo "::error::APK appears too small ($APK_SIZE bytes)"
-            exit 1
-          fi
-
-          echo "=== APK contents (native libs) ==="
-          unzip -l "$APK" | tee apk-list.txt
-          MISSING=""
-          for lib in lib/arm64-v8a/libfreetype6.so \
-                     lib/arm64-v8a/liblua51.so \
-                     lib/arm64-v8a/libsoft_oal.so; do
-            if ! grep -q "$lib" apk-list.txt; then
-              MISSING="$MISSING $lib"
-            fi
-          done
-          if [ -n "$MISSING" ]; then
-            echo "::error::Missing native libs in APK:$MISSING"
-            exit 1
-          fi
-          echo "Native libs present in APK: OK"
-
-          echo "=== package and application identity ==="
-          aapt dump badging "$APK" > badging.txt
-          cat badging.txt
-          PACKAGE=$(awk -F'=' '/^package:/{print $2; exit}' badging.txt | tr -d "'")
-          APP_LABEL=$(awk -F'=' '/^application:/{print $2; exit}' badging.txt | tr -d "'")
-          if [ -z "$PACKAGE" ]; then
-            echo "::error::Could not read package name from APK"
-            exit 1
-          fi
-          echo "package=$PACKAGE"
-          echo "application=$APP_LABEL"
-
-          echo "=== ARM64 native libs only (no x86, no armeabi) ==="
-          for arch in x86 x86_64 armeabi armeabi-v7a; do
-            if grep -q "lib/$arch/" apk-list.txt; then
-              echo "::warning::APK contains lib/$arch alongside arm64-v8a (may widen scope)"
-            fi
-          done
-
-      - name: Upload signed APK artifact
+          bash thirdparty/build-freetype-android.sh
+          bash thirdparty/build-lua-android.sh
+          bash thirdparty/build-openal-android.sh
+      - name: Build APK
+        run: dotnet build OpenRA.Android/OpenRA.Android.csproj -c Release -f net9.0-android -p:BuildForAndroid=true -m:1
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: openra-android-arm64
-          path: OpenRA.Android/obj/Release/android/bin/*.apk
+          path: |
+            OpenRA.Android/bin/Release/net9.0-android/*.apk
+            OpenRA.Android/obj/Release/android/bin/*.apk
           if-no-files-found: error

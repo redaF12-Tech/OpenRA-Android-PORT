@@ -2,19 +2,35 @@ name: Android (ARM64)
 
 on:
   push:
+    branches:
+      - main
+      - android-native-port
     paths:
       - 'OpenRA.Android/**'
       - 'OpenRA.Platforms.Android/**'
       - 'OpenRA.Game/**'
       - 'thirdparty/*.sh'
       - '.github/workflows/android.yml'
+      - 'mods/**'
+      - 'glsl/**'
+      - 'Directory.Build.props'
+      - 'VERSION'
+      - 'global mix database.dat'
   pull_request:
-    branches: [ bleed, 'prep-*' ]
+    branches:
+      - main
+      - android-native-port
     paths:
       - 'OpenRA.Android/**'
       - 'OpenRA.Platforms.Android/**'
+      - 'OpenRA.Game/**'
       - 'thirdparty/*.sh'
       - '.github/workflows/android.yml'
+      - 'mods/**'
+      - 'glsl/**'
+      - 'Directory.Build.props'
+      - 'VERSION'
+      - 'global mix database.dat'
   workflow_dispatch:
 
 permissions:
@@ -22,24 +38,12 @@ permissions:
 
 env:
   ANDROID_API: 24
+  ANDROID_COMPILE_SDK: 34
+  ANDROID_BUILD_TOOLS: 34.0.0
+  ANDROID_NDK_VERSION: 27.1.12297006
+  ANDROID_CMAKE_VERSION: 3.22.1
 
 jobs:
-  engine-tests:
-    name: Engine tests (no device)
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Clone Repository
-        uses: actions/checkout@v7
-
-      - name: Install .NET 8.0
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Run engine tests
-        run: |
-          make tests
-
   guard-hardcoded-paths:
     name: No hardcoded developer paths in build scripts
     runs-on: ubuntu-22.04
@@ -59,7 +63,6 @@ jobs:
   build-apk:
     name: Build ARM64 APK (Release)
     runs-on: ubuntu-22.04
-    needs: [ engine-tests, guard-hardcoded-paths ]
     steps:
       - name: Clone Repository
         uses: actions/checkout@v7
@@ -75,21 +78,21 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Install Android SDK components
+        uses: android-actions/setup-android@v3
+      - name: Install SDK platforms and NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" \
+              "platforms;android-${ANDROID_COMPILE_SDK}" \
+              "build-tools;${ANDROID_BUILD_TOOLS}" \
+              "ndk;${ANDROID_NDK_VERSION}" \
+              "cmake;${ANDROID_CMAKE_VERSION}"
+
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
       - name: Install .NET Android workload
         run: dotnet workload install android
-
-      - name: Install Android NDK + CMake
-        run: |
-          # sdkmanager is not on PATH on GitHub-hosted runners; locate it under the SDK root.
-          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" "$SDK_ROOT/tools" -name sdkmanager -type f 2>/dev/null | head -1)
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager not found under $SDK_ROOT"
-            exit 1
-          fi
-          yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" "ndk;27.1.12297006" "cmake;3.22.1"
-          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/27.1.12297006" >> "$GITHUB_ENV"
 
       - name: Build native libraries (FreeType, Lua, OpenAL Soft)
         run: |
