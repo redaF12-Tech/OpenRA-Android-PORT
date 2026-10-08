@@ -1,0 +1,211 @@
+name: OpenRA Android ARM64 CI
+
+on:
+  push:
+    branches:
+      - android-native-port
+    paths:
+      - 'OpenRA.Android/**'
+      - 'OpenRA.Platforms.Android/**'
+      - 'OpenRA.Game/**'
+      - 'OpenRA.Mods.Common/**'
+      - 'OpenRA.Mods.Cnc/**'
+      - 'OpenRA.Mods.D2k/**'
+      - 'thirdparty/**'
+      - 'glsl/**'
+      - 'mods/**'
+      - 'VERSION'
+      - 'global mix database.dat'
+      - 'Directory.Build.props'
+      - 'Makefile'
+      - '.github/workflows/android.yml'
+
+  pull_request:
+    branches:
+      - android-native-port
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openra-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine-tests:
+    name: Engine tests
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Run engine tests
+        run: make tests
+
+  build-apk:
+    name: Build Android ARM64 APK
+    runs-on: ubuntu-22.04
+    needs: engine-tests
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android workload
+        run: dotnet workload install android
+
+      - name: Configure Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK not found: $SDK_ROOT"
+            exit 1
+          fi
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null | head -n 1)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found in Android SDK"
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "ndk;27.1.12297006" \
+            "cmake;3.22.1"
+
+          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/27.1.12297006" \
+            >> "$GITHUB_ENV"
+
+      - name: Verify native build scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for script in \
+            thirdparty/build-freetype-android.sh \
+            thirdparty/build-lua-android.sh \
+            thirdparty/build-openal-android.sh
+          do
+            test -f "$script" || {
+              echo "::error::Missing required script: $script"
+              exit 1
+            }
+          done
+
+      - name: Build native ARM64 libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sh ./thirdparty/build-freetype-android.sh
+          sh ./thirdparty/build-lua-android.sh
+          sh ./thirdparty/build-openal-android.sh
+
+      - name: Verify required native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LIBDIR="OpenRA.Android/jniLibs/arm64-v8a"
+
+          for lib in \
+            libfreetype6.so \
+            liblua51.so \
+            libsoft_oal.so
+          do
+            FILE="$LIBDIR/$lib"
+
+            test -f "$FILE" || {
+              echo "::error::Missing native library: $FILE"
+              exit 1
+            }
+
+            file "$FILE"
+            file "$FILE" | grep -q "aarch64" || {
+              echo "::error::Not an ARM64 library: $FILE"
+              exit 1
+            }
+          done
+
+      - name: Build Android APK
+        run: |
+          dotnet build OpenRA.Android/OpenRA.Android.csproj \
+            --configuration Release \
+            --framework net9.0-android \
+            -p:BuildForAndroid=true \
+            -m:1
+
+      - name: Locate and validate APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find OpenRA.Android \
+            -type f -name '*.apk' \
+            -path '*/Release/*' \
+            -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::Build completed without producing an APK"
+            find OpenRA.Android -type f -name '*.apk' -print
+            exit 1
+          fi
+
+          echo "APK found: $APK"
+
+          mkdir -p artifacts
+          cp "$APK" artifacts/OpenRA-Android-ARM64.apk
+
+          unzip -t artifacts/OpenRA-Android-ARM64.apk
+
+          unzip -l artifacts/OpenRA-Android-ARM64.apk \
+            > artifacts/apk-contents.txt
+
+          for lib in \
+            lib/arm64-v8a/libfreetype6.so \
+            lib/arm64-v8a/liblua51.so \
+            lib/arm64-v8a/libsoft_oal.so
+          do
+            grep -Fq "$lib" artifacts/apk-contents.txt || {
+              echo "::error::APK is missing $lib"
+              exit 1
+            }
+          done
+
+      - name: Upload APK and build manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: openra-android-arm64-${{ github.sha }}
+          path: |
+            artifacts/OpenRA-Android-ARM64.apk
+            artifacts/apk-contents.txt
+          if-no-files-found: error
+          retention-days: 14
