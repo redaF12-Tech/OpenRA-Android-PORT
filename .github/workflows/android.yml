@@ -78,18 +78,33 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # packages: '' skips the action's default 'tools platform-tools' install, which fails
+      # because the deprecated SDK 'tools' package is no longer published by sdkmanager.
       - name: Install Android SDK components
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - name: Install SDK platforms and NDK
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platform-tools" \
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager --install "platform-tools" \
               "platforms;android-${ANDROID_COMPILE_SDK}" \
               "build-tools;${ANDROID_BUILD_TOOLS}" \
               "ndk;${ANDROID_NDK_VERSION}" \
               "cmake;${ANDROID_CMAKE_VERSION}"
 
+          # Fail loudly if any required component failed to install.
+          for pkg in "platform-tools" "platforms;android-${ANDROID_COMPILE_SDK}" "build-tools;${ANDROID_BUILD_TOOLS}" "ndk;${ANDROID_NDK_VERSION}" "cmake;${ANDROID_CMAKE_VERSION}"; do
+            if ! sdkmanager --list 2>/dev/null | grep -qF "$pkg "; then
+              echo "::error::Required Android SDK component failed to install: $pkg"
+              exit 1
+            fi
+          done
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          test -d "$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" || { echo "::error::NDK not found at $ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"; exit 1; }
 
       - name: Install .NET Android workload
         run: dotnet workload install android
